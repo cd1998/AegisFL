@@ -1,0 +1,182 @@
+import torch
+import torchvision.models as models
+import torch.nn.functional as F
+from scipy.stats import mode
+from torch import optim
+import get_har
+import get_mnist
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
+import net
+import attack
+from sklearn.metrics.pairwise import cosine_similarity
+import hdbscan
+import copy
+import numpy as np
+seed = 42
+torch.manual_seed(seed)
+
+def train_model(dataset,num_clients,num_mal_clients,scaling_factor,local_iteration,global_iteration,attack_type):
+    num_clients = num_clients
+    num_mal_clients = num_mal_clients
+    scaling_factor = scaling_factor
+    attack_type = attack_type
+    if dataset == "HAR":
+        number_label = 6
+        X_test, y_test, train_loader, test_loader = get_har.get_data()
+        each_worker_data, each_worker_label = get_har.assign_data(train_data=train_loader)
+        copy.deepcopy(each_worker_data)
+        each_worker_data_du, each_worker_label_du = copy.deepcopy(each_worker_data), copy.deepcopy(each_worker_label)
+        aggregation_model = net.Full_connect_har()
+        aggregation_optimize = optim.SGD(aggregation_model.parameters(), lr=0.03)
+
+        # for model_param in aggregation_model.parameters():
+        #     print('aggregation_model_param',model_param.data)
+        # print('----------------------------------------------')
+
+        client_model = []
+        client_optimize = []
+        for i in range(num_clients):
+            classfier = net.Full_connect_har()
+            classfier.load_state_dict(aggregation_model.state_dict())
+            client_model.append(classfier)
+            # 创建 优化器
+            optimizer = optim.SGD(client_model[i].parameters(), lr=0.03)
+            client_optimize.append(optimizer)
+    else:
+        number_label = 10
+        each_worker_data, each_worker_label, X_test, y_test = get_mnist.get_data()
+        each_worker_data_du, each_worker_label_du, X_test_du, y_test_du = get_mnist.get_data()
+        aggregation_model = net.Full_connect_mnist()
+        aggregation_optimize = optim.SGD(aggregation_model.parameters(), lr=0.03)
+        client_model = []
+        client_optimize = []
+        for i in range(num_clients):
+            classfier = net.Full_connect_mnist()
+            classfier.load_state_dict(aggregation_model.state_dict())
+            client_model.append(classfier)
+            # 创建 优化器
+            optimizer = optim.SGD(client_model[i].parameters(), lr=0.03)
+            client_optimize.append(optimizer)
+
+    # 创建 损失函数
+    criterion = torch.nn.CrossEntropyLoss()
+
+    local_iteration = local_iteration
+    for epoch in range(local_iteration):
+        for i in range(num_clients):
+            # 1. 前向传播, 预测输出
+            outputs = client_model[i](each_worker_data[i])
+            # 2. 计算损失值
+            loss = criterion(outputs, each_worker_label[i])
+            # 3. 梯度清零
+            client_optimize[i].zero_grad()
+            # 4. 误差反向传播, 计算梯度并累加
+            loss.backward()
+            # 5. 更新模型参数
+            client_optimize[i].step()
+
+    client_gradient_round_1 = []
+    for i in range(num_clients):
+        client_gradient_round_1.append(torch.sub(parameters_to_vector(aggregation_model.parameters()),
+                                           parameters_to_vector(client_model[i].parameters())))
+    global_gradient_vector = sum(client_gradient_round_1) / num_clients
+    global_gradient_detach = global_gradient_vector.detach()
+    global_gradient_numpy = global_gradient_detach.numpy()
+
+    aggregation_model_vector = torch.sub(parameters_to_vector(aggregation_model.parameters()), global_gradient_vector)
+    print('dddddddddd',aggregation_model_vector)
+
+    vector_to_parameters(aggregation_model_vector,aggregation_model.parameters())
+    torch.save(aggregation_model.state_dict(), f'model/fedavg.pt')
+    aggregation_model.load_state_dict(torch.load(f'model/fedavg.pt'))
+    for i in range(num_clients):
+        client_model[i].load_state_dict(torch.load(f'model/fedavg.pt'))
+
+
+    if attack_type == "backdoor":
+        each_worker_data_malicious, each_worker_label_malicious = attack.scaling_attack_insert_backdoor(each_worker_data_du, each_worker_label_du, num_clients)
+        X_test_with_backdoor, y_test_with_backdoor = attack.add_backdoor(X_test.clone(),y_test.clone())  # 不用clone()会改变X_test,y_test原本的值，因为在python中，对象通常传递的是地址
+
+        print(each_worker_label_malicious[1])
+        print(each_worker_label[1])
+        print(each_worker_label_du[1])
+
+    if attack_type == "flipping":
+        each_worker_label_malicious = attack.label_flipping_attack(each_worker_label_du, num_clients)
+        print(each_worker_label_malicious[1])
+        print(each_worker_label[1])
+        print(each_worker_label_du[1])
+
+    global_iteration = global_iteration
+    for round in range(global_iteration):
+        random_numbers = np.arange(num_mal_clients)
+        for epoch in range(local_iteration):
+            for i in range(num_clients):
+                if i in random_numbers and attack_type == "backdoor":
+                    outputs = client_model[i](each_worker_data_malicious[i])
+                    loss = criterion(outputs, each_worker_label_malicious[i])
+                    client_optimize[i].zero_grad()
+                    loss.backward()
+                    client_optimize[i].step()
+                elif i in random_numbers and attack_type == "flipping":
+                    outputs = client_model[i](each_worker_data[i])
+                    loss = criterion(outputs, each_worker_label_malicious[i])
+                    client_optimize[i].zero_grad()
+                    loss.backward()
+                    client_optimize[i].step()
+                else:
+                    outputs = client_model[i](each_worker_data[i])
+                    loss = criterion(outputs, each_worker_label[i])
+                    client_optimize[i].zero_grad()
+                    loss.backward()
+                    client_optimize[i].step()
+
+        client_gradient_round = []
+        for i in range(num_clients):
+            a = torch.sub(parameters_to_vector(aggregation_model.parameters()),parameters_to_vector(client_model[i].parameters()))
+            if i in random_numbers and attack_type == "backdoor":
+                a.mul_(scaling_factor)
+            if i in random_numbers and attack_type == "ut":
+                a.normal_(mean=0,std=1)
+            client_gradient_round.append(a)
+
+        global_gradient_vector = sum(client_gradient_round) / num_clients
+        global_gradient_detach = global_gradient_vector.detach()
+        global_gradient_numpy = global_gradient_detach.numpy()
+
+
+        aggregation_model_vector = torch.sub(parameters_to_vector(aggregation_model.parameters()),global_gradient_vector)
+        vector_to_parameters(aggregation_model_vector, aggregation_model.parameters())
+        torch.save(aggregation_model.state_dict(), f'model/fedavg.pt')
+        aggregation_model.load_state_dict(torch.load(f'model/fedavg.pt'))
+        for i in range(num_clients):
+            client_model[i].load_state_dict(torch.load(f'model/fedavg.pt'))
+
+
+        # 预测的输出标签类别 (每行取概率最大的索引为标签类别值)
+        outputs = aggregation_model(X_test)
+        output_labels = torch.max(outputs, dim=1)[1]
+
+        # 预测准确的数量 (相同位置的类别值相等则为True, 不能则为False, True是1, False是0, 全部结果相加就是正确预测的数量)
+        accurate_count = torch.sum(output_labels == y_test)
+        # 计算准确率
+        accuracy = accurate_count / output_labels.shape[0]
+        loss = criterion(outputs, y_test)
+        print(f"Round[{round}/{global_iteration}]: loss={loss}, accuracy={accuracy:.3f}")
+
+
+        if attack_type == "backdoor":
+            outputs_backdoor = aggregation_model(X_test_with_backdoor)
+            output_labels_backdoor = torch.max(outputs_backdoor, dim=1)[1]
+            accurate_count_backdoor = torch.sum(output_labels_backdoor == y_test_with_backdoor)
+            accuracy_backdoor = accurate_count_backdoor / output_labels_backdoor.shape[0]
+            print(f"backdoor attack success rate = {accuracy_backdoor:.3f}")
+
+
+if __name__ == "__main__":
+    train_model(dataset="HAR",num_clients=30,num_mal_clients=12,scaling_factor=5,local_iteration=50,global_iteration=100,attack_type="no")
+
+
+
+
+
